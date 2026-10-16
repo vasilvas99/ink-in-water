@@ -1,0 +1,16 @@
+[project]
+name = "ink-in-water"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.14"
+dependencies = [
+    "mkl>=2026.2.0",
+    "ngsolve>=6.2.2608",
+    "nvidia-cuda-runtime-cu12>=12.9.79",
+    "nvidia-nvjitlink-cu12>=12.9.86",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.1",
+]

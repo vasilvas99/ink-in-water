@@ -1,0 +1,158 @@
+import ngsolve
+from netgen.geom2d import SplineGeometry
+from ngsolve import (
+    H1,
+    BilinearForm,
+    CoefficientFunction,
+    FESpace,
+    GridFunction,
+    Mesh,
+    Norm,
+    TaskManager,
+    VTKOutput,
+    dx,
+    exp,
+    grad,
+    specialcf,
+    sqrt,
+    x,
+    y,
+)
+from ngsolve.solvers.mkl_pardiso import MKLPardiso
+
+
+class MatchedSymmetricPardiso(MKLPardiso):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._force_symmetric = True
+
+    def _call_pardiso(self, phase):
+        if phase == 12:
+            if self._matrixtype[0] != -2:
+                raise ValueError(
+                    "Matched symmetric adapter requires a real indefinite matrix"
+                )
+            self._params[10] = 1  # Scaling together with symmetric matching.
+            self._params[12] = 1  # Enable after NGSolve Analyze resets matching.
+            self._params[20] = 1  # 1x1/2x2 Bunch-Kaufman pivoting.
+        return super()._call_pardiso(phase)
+
+
+def register_matched_pardiso():
+    name = "pardiso_symmetric_matching"
+    ngsolve.la.RegisterInverseType(name, MatchedSymmetricPardiso)
+    return name
+
+
+nu = 1e-6
+beta = 0.01
+g = 9.81
+d = 3e-2
+tau = 0.0005
+Tmax = 100
+eps_p = 1e-10
+mesh_parameter = 0.4
+alpha_supg = 0.2
+c0 = exp(-(x * x + (y - 5) * (y - 5)) / 5)  # gaussian hill as the initial "ink drop"
+
+geo = SplineGeometry()
+geo.AddRectangle((-10, -10), (10, 10), bcs=("wall", "wall", "wall", "wall"))
+mesh = Mesh(geo.GenerateMesh(maxh=mesh_parameter))
+
+# Taylor-Hood
+V = H1(mesh, order=2, dirichlet="wall")  # velocity space
+Q = H1(mesh, order=1)  # P1 for pressure
+
+# concentration-space
+C = H1(mesh, order=2)
+
+# Full FE space -> (velocity, velocity, pressure, concentration)
+X = FESpace([V, V, Q, C])
+
+u, v, p, c = X.TrialFunction()
+wx, wy, q, z = X.TestFunction()
+u_vec = CoefficientFunction((u, v))
+
+div_u_vec = grad(u)[0] + grad(v)[1]
+div_w_vec = grad(wx)[0] + grad(wy)[1]
+
+# velocity dependant SUPG strength
+h = specialcf.mesh_size
+speed = Norm(u_vec)
+delta_supg = alpha_supg / sqrt(
+    (2 / tau) ** 2 + (2 * speed / h) ** 2 + (4 * d / h**2) ** 2
+)
+
+
+# the linear form
+linear_form = (
+    nu * (grad(u) * grad(wx) + grad(v) * grad(wy))
+    - p * div_w_vec
+    - div_u_vec * q
+    + d * (grad(c) * grad(z))
+    - eps_p * p * q
+)
+a = BilinearForm(X)
+a += linear_form * dx
+a.Assemble()
+
+# M^= M + tau * A
+mass = u * wx + v * wy + c * z
+m_hat = BilinearForm(X)
+m_hat += (mass + tau * linear_form) * dx
+m_hat.Assemble()
+
+m_hat_inv = m_hat.mat.Inverse(X.FreeDofs(), inverse=register_matched_pardiso())
+
+# the nonlinear form + SUPG term
+nonlinear = (
+    u_vec * grad(u) * wx
+    + u_vec * grad(v) * wy
+    + u_vec * grad(c) * z
+    + delta_supg * (u_vec * grad(c) * u_vec * grad(z))
+    + beta * g * c * wy
+)
+nf = BilinearForm(X, nonassemble=True)
+nf += nonlinear.Compile() * dx
+
+grid_sol = GridFunction(X)
+residual = grid_sol.vec.CreateVector()
+
+# u, v, p are default initialized to 0
+grid_sol.components[3].Set(c0)  # initialize c to c0
+
+# Draw(grid_sol.components[3], mesh, "concentration", min=0, max=1)
+# viewoptions.drawoutline = 0  # do not show triangles in ngsolve
+
+vtk = VTKOutput(
+    ma=mesh,
+    coefs=[
+        CoefficientFunction((grid_sol.components[0], grid_sol.components[1])),
+        grid_sol.components[2],
+        grid_sol.components[3],
+    ],
+    names=["velocity", "pressure", "concentration"],
+    filename="output_real_2/simulation",
+    subdivision=2,
+)
+
+with TaskManager():
+    N_max = round(Tmax / tau)
+    for n in range(N_max):
+        # N_t(U^n)
+        nf.Apply(
+            grid_sol.vec, residual
+        )  # evaluate the non-linear form nf at grid_sol.vec and store in residual
+        # (A * U^n) + N_t(U^n)
+        residual.data += (
+            a.mat * grid_sol.vec
+        )  # grid_sol.vec is the coefficients vector, i.e. U^n
+        # deltaU = - tau * Mh^-1 (A U^n + N_t(U^n)
+        deltaU = -tau * m_hat_inv * residual
+
+        # update the grid solution (do the real time step)
+        grid_sol.vec.data += deltaU
+        if n % 200 == 0:
+            vtk.Do(time=n * tau)
+        print(f"Completed {n}/{N_max} steps")
+        # Redraw()
