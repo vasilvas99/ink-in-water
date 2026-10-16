@@ -2,3 +2,4 @@
 .venv_wsl
 output_*/
 .idea/
+__pycache__/
